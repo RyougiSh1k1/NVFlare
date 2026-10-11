@@ -45,7 +45,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -84,12 +84,18 @@ class DownloadTCGABRCATest(unittest.TestCase):
         return path
 
     def response_with_files(self, entries):
+        members = []
+        for hit, payload in entries:
+            member = tarfile.TarInfo(f'{hit["file_id"]}/{hit["file_name"]}')
+            member.size = len(payload)
+            members.append((member, payload))
+        return self.response_with_members(members)
+
+    def response_with_members(self, members):
         archive_bytes = io.BytesIO()
         with tarfile.open(fileobj=archive_bytes, mode="w:gz") as archive:
-            for hit, payload in entries:
-                member = tarfile.TarInfo(f'{hit["file_id"]}/{hit["file_name"]}')
-                member.size = len(payload)
-                archive.addfile(member, io.BytesIO(payload))
+            for member, payload in members:
+                archive.addfile(member, io.BytesIO(payload) if member.isfile() else None)
         response = Mock()
         response.iter_content.return_value = [archive_bytes.getvalue()]
         self.session.post.return_value = response
@@ -107,6 +113,116 @@ class DownloadTCGABRCATest(unittest.TestCase):
 
     def completed_ids(self):
         return json.loads(self.ledger.read_text())
+
+    def test_regular_files_are_streamed_without_extracting_archive_metadata(self):
+        member = tarfile.TarInfo(f'{self.hit["file_id"]}/{self.hit["file_name"]}')
+        member.size = len(self.payload)
+        member.mode = 0o777
+        directory = tarfile.TarInfo(self.hit["file_id"])
+        directory.type = tarfile.DIRTYPE
+        metadata = tarfile.TarInfo("MANIFEST.txt")
+        metadata.size = len(self.payload)
+        self.response_with_members([(directory, b""), (metadata, self.payload), (member, self.payload)])
+
+        with patch.object(tarfile.TarFile, "extract", side_effect=AssertionError("Do not extract archive metadata")):
+            self.download()
+
+        target = self.raw_dir / self.hit["file_id"] / self.hit["file_name"]
+        self.assertEqual(target.read_bytes(), self.payload)
+        self.assertEqual(target.stat().st_mode & 0o111, 0)
+        self.assertFalse((self.raw_dir / "MANIFEST.txt").exists())
+        self.assertEqual(self.completed_ids(), [self.hit["file_id"]])
+
+    def test_unsafe_archive_paths_are_rejected_before_extraction(self):
+        names = [
+            "../outside.tsv",
+            f"{self.raw_dir.parent}/outside.tsv",
+            f'{self.hit["file_id"]}/../../outside.tsv',
+            f'{self.hit["file_id"]}/nested/{self.hit["file_name"]}',
+            "..\\outside.tsv/payload.tsv",
+        ]
+        for name in names:
+            with self.subTest(name=name):
+                member = tarfile.TarInfo(name)
+                member.size = len(self.payload)
+                self.response_with_members([(member, self.payload)])
+                # Also prevents the old implementation from writing to an absolute
+                # filesystem path when demonstrating this regression.
+                with patch.object(tarfile.TarFile, "extract") as unsafe_extract:
+                    with self.assertRaisesRegex(ValueError, "archive member"):
+                        self.download()
+                unsafe_extract.assert_not_called()
+                self.assertFalse((self.raw_dir.parent / "outside.tsv").exists())
+                self.assertEqual(self.completed_ids(), [])
+
+    def test_archive_payload_must_match_the_requested_manifest(self):
+        names = [f'other-id/{self.hit["file_name"]}', f'{self.hit["file_id"]}/other.tsv']
+        for name in names:
+            with self.subTest(name=name):
+                member = tarfile.TarInfo(name)
+                member.size = len(self.payload)
+                self.response_with_members([(member, self.payload)])
+                with self.assertRaisesRegex(ValueError, "manifest"):
+                    self.download()
+                self.assertFalse((self.raw_dir / name).exists())
+                self.assertEqual(self.completed_ids(), [])
+
+    def test_archive_links_are_rejected_without_following_their_targets(self):
+        for member_type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+            with self.subTest(member_type=member_type):
+                member = tarfile.TarInfo(f'{self.hit["file_id"]}/{self.hit["file_name"]}')
+                member.type = member_type
+                member.linkname = "../../outside.tsv"
+                self.response_with_members([(member, b"")])
+                with self.assertRaisesRegex(ValueError, "archive member"):
+                    self.download()
+                self.assertFalse((self.raw_dir.parent / "outside.tsv").exists())
+                self.assertEqual(self.completed_ids(), [])
+
+    def test_existing_symlinks_cannot_redirect_downloads_outside_raw_directory(self):
+        outside = self.raw_dir.parent / "outside"
+        outside.mkdir()
+        sentinel = outside / self.hit["file_name"]
+        sentinel.write_bytes(b"keep me")
+        file_dir = self.raw_dir / self.hit["file_id"]
+        for link_directory in (True, False):
+            with self.subTest(link_directory=link_directory):
+                if link_directory:
+                    link = file_dir
+                    link.symlink_to(outside, target_is_directory=True)
+                else:
+                    file_dir.mkdir()
+                    link = file_dir / self.hit["file_name"]
+                    link.symlink_to(sentinel)
+                try:
+                    self.response_with_files([(self.hit, self.payload)])
+                    with self.assertRaisesRegex(ValueError, "download directory"):
+                        self.download()
+                    self.assertEqual(sentinel.read_bytes(), b"keep me")
+                    self.session.post.assert_not_called()
+                finally:
+                    link.unlink()
+                    if not link_directory:
+                        file_dir.rmdir()
+                    self.session.reset_mock()
+
+    def test_manifest_path_components_are_validated_before_network_access(self):
+        cases = [
+            ("file_id", ".."),
+            ("file_id", "../outside"),
+            ("file_id", str(self.raw_dir.parent / "outside")),
+            ("file_name", "../outside.tsv"),
+            ("file_name", str(self.raw_dir.parent / "outside.tsv")),
+            ("file_name", "..\\outside.tsv"),
+        ]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                hit = dict(self.hit, **{field: value})
+                self.response_with_files([])
+                with self.assertRaisesRegex(ValueError, "manifest"):
+                    self.download([hit])
+                self.session.post.assert_not_called()
+                self.session.reset_mock()
 
     def test_stale_ledger_does_not_skip_missing_file(self):
         self.ledger.write_text(json.dumps([self.hit["file_id"]]))

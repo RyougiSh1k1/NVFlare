@@ -263,8 +263,8 @@ class PredNet(nn.Module):
         # Get softmax probabilities
         softmax_probs = F.softmax(logits, dim=1)
 
-        # Get log probabilities (add small epsilon to avoid log(0))
-        log_probs = torch.log(softmax_probs + 1e-10)
+        # Preserve finite log probabilities and gradients for extreme logits.
+        log_probs = F.log_softmax(logits, dim=1)
 
         # Reshape outputs if needed
         if x_copy.dim() > 2:

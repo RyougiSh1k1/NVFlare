@@ -59,12 +59,16 @@
     "aggregation": "average E/F/G weights across clients",
     "client_state_returned": ["Adam optimizer", "learning-rate scheduler", "task label counts", "task batch sizes"],
     "learning_rates_default": {"E": 0.0001, "F": 0.0001, "G": 0.0001, "D": 0.0001},
+    "weight_decay_default": 0.0,
+    "weight_decay_scope": "--weight-decay applies to all client E/F/G Adam parameter groups and the server D Adam optimizer; finite nonnegative values only",
+    "weight_decay_provenance": "The previous CLI advertised 1e-4 but neither Adam optimizer used it, so effective decay was zero. The default preserves that behavior; explicit positive values now change training updates.",
+    "graph_conditioning": "required for E and G; the unused --use-g-encode switch has been removed",
     "checkpoint_compatibility": "Old label-conditioned E and graph-embedding G checkpoints cannot be loaded directly into the new E/G architectures."
   },
   "source_reproducible_data_protocol": {
     "main_prediction_input": "TCGA-BRCA expression features with log1p values standardized using only final eligible training records",
     "prediction_target": "inherited unchanged from the TCGA-BRCA GFedCL workflow",
-    "train_test_split": "group by case_submitter_id globally; split approximately 80/20 patients stratified by Normal-only, Tumor-only, or mixed labels before assigning tasks and clients; clinical_stage and random use the same patient-disjoint protocol",
+    "train_test_split": "group by case_submitter_id globally; --train-split controls the training patient fraction (default 0.8), with remaining patients used for evaluation and no separate --test-split option; proportions are approximate after stratification by Normal-only, Tumor-only, or mixed labels; clinical_stage and random use the same patient-disjoint protocol before assigning tasks and clients",
     "partition_validation": "train/test patient and sample IDs must be disjoint; record indices cannot be duplicated across assignments; every client/task must have training and evaluation records without copying records to fill empty splits",
     "partition_audit": "partition pickle records split_unit='patient', split_protocol_version=2, per-index patient/sample/file IDs, and identity_split train/test patient and sample lists",
     "normalization_scope": "expression mean and scale are fitted on the union of final eligible training record indices after patient and task assignment; evaluation records and excluded unknown-stage tumors do not participate; the same statistics transform training and evaluation data",
@@ -144,5 +148,48 @@
       "detail": "The authors' public GFedCL repository omits the TCGA-BRCA implementation."
     }
   ],
+  "implementation_validation": {
+    "date": "2026-10-10",
+    "scope": "Validation of the implementation after review fixes; the original search protocol and paper metrics above remain unchanged.",
+    "environment": {
+      "name": "breastgfcl Miniconda",
+      "python": "3.10.22",
+      "pytorch": "2.5.1",
+      "pytorch_cuda_build": "12.4",
+      "numpy": "2.2.6",
+      "nvflare": "2.9.0"
+    },
+    "regression_tests_passed": 171,
+    "multiprocess_cpu_smoke": {
+      "status": "passed",
+      "data": "synthetic fixture",
+      "clients": 4,
+      "tasks": 3,
+      "rounds_per_task": 2,
+      "local_epochs_per_round": 1,
+      "restored_client_task_accuracy_cells": 12
+    },
+    "selected_configuration_final_refits": {
+      "status": "passed",
+      "training_seeds": [
+        42,
+        43,
+        44
+      ],
+      "partition_and_preprocessing_seed": 42,
+      "training_records": 894,
+      "evaluation_records": 225,
+      "clients": 4,
+      "tasks": 3,
+      "rounds_per_task": 10,
+      "local_epochs_per_round": 3,
+      "completed_rounds_total": 90,
+      "restored_client_task_accuracy_cells": 36,
+      "selection": "Three fresh final refits of the previously locked configuration; no hyperparameter search repeated and no outer-evaluation retuning or checkpoint selection.",
+      "limitations": "One fixed, previously inspected outer split; training-seed variation is not a patient-level confidence interval, and the rerun does not claim exact author-experiment or bitwise historical-model reproduction."
+    },
+    "results_documentation": "../../README.md#recorded-nvflare-experiment",
+    "validation_documentation": "../../README.md#expected-results"
+  },
   "status": "graph_equations_and_public_sources_reproduced_exact_author_attention_blocked"
 }

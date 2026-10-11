@@ -60,7 +60,6 @@ def make_opt(**overrides):
     options = dict(
         device="cpu",
         batch_size=4,
-        use_g_encode=True,
         input_dim=8,
         nh=16,
         ni=16,

@@ -73,7 +73,10 @@ class Server:
 
         # Set up optimizer
         self.optimizer_D = optim.Adam(
-            self.global_discriminator.parameters(), lr=opt.lr_d, betas=(opt.beta1, getattr(opt, "beta2", 0.999))
+            self.global_discriminator.parameters(),
+            lr=opt.lr_d,
+            betas=(opt.beta1, getattr(opt, "beta2", 0.999)),
+            weight_decay=getattr(opt, "weight_decay", 0.0),
         )
 
         # Set up learning rate scheduler

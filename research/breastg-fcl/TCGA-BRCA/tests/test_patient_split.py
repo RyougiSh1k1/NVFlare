@@ -15,6 +15,7 @@
 """Patient-disjoint TCGA partitions and sparse-cohort regression cases."""
 
 import copy
+import csv
 import os
 import sys
 import tempfile
@@ -25,11 +26,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
+from model.client import ModifiedClient
 from utils import dataset_utils
 
 
@@ -303,6 +307,118 @@ class PatientSplitTest(unittest.TestCase):
         for strategy in ("clinical_stage", "random"):
             with self.subTest(strategy=strategy), self.assertRaises(ValueError):
                 self.make_tasks(strategy, records=records, targets=targets, clinical=clinical)
+
+
+class BinaryClassVocabularyTest(unittest.TestCase):
+    def make_partial_download(self, root, available_labels):
+        """Keep both classes in the manifest but download only the selected ones."""
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        manifest_path = root / "manifest.tsv"
+        fieldnames = [
+            "file_id",
+            "file_name",
+            "case_submitter_id",
+            "sample_submitter_id",
+            "sample_type",
+            "tissue_type",
+        ]
+        with manifest_path.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames, delimiter="\t")
+            writer.writeheader()
+            for patient_index in range(12):
+                patient = f"TCGA-ZZ-{patient_index:04d}"
+                for tissue, label in (("Normal", 0), ("Tumor", 1)):
+                    file_id = f"{patient}-{tissue}"
+                    writer.writerow(
+                        {
+                            "file_id": file_id,
+                            "file_name": "expression.tsv",
+                            "case_submitter_id": patient,
+                            "sample_submitter_id": f"{patient}-{'11A' if label == 0 else '01A'}",
+                            "sample_type": "Solid Tissue Normal" if label == 0 else "Primary Tumor",
+                            "tissue_type": tissue,
+                        }
+                    )
+                    if label in available_labels:
+                        destination = raw_dir / file_id
+                        destination.mkdir()
+                        (destination / "expression.tsv").write_text(
+                            "gene_id\tgene_type\ttpm_unstranded\n"
+                            f"gene-a\tprotein_coding\t{patient_index + label + 1}\n"
+                            f"gene-b\tprotein_coding\t{(patient_index + 2) ** 2}\n"
+                        )
+        for name in ("spatial.csv", "temporal.csv"):
+            (root / name).write_text(
+                "case_id,feature_a,feature_b\n"
+                + "".join(f"TCGA-ZZ-{index:04d},{index + 1},{index + 2}\n" for index in range(12))
+            )
+        return SimpleNamespace(
+            output_dir=str(root / "output"),
+            data_dir=str(root),
+            raw_dir=str(raw_dir),
+            manifest_path=str(manifest_path),
+            tcia_mri_features_path=str(root / "spatial.csv"),
+            tcia_dce_kinetics_path=str(root / "temporal.csv"),
+            task_split_strategy="random",
+            num_clients=2,
+            num_task=1,
+            train_split=0.5,
+            seed=42,
+            expression_value_col="tpm_unstranded",
+            max_genes=2,
+            batch_size=4,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            device="cpu",
+            nh=8,
+            noise_dim=3,
+            no_bn=False,
+            p=0.0,
+            lr_e=0.001,
+            lr_f=0.001,
+            lr_g=0.001,
+            beta1=0.9,
+            beta2=0.999,
+        )
+
+    def assert_binary_model_for_download(self, available_labels):
+        with tempfile.TemporaryDirectory() as directory, torch.random.fork_rng(devices=[]):
+            torch.manual_seed(42)
+            opt = self.make_partial_download(Path(directory), available_labels)
+            loaders = dataset_utils.setup_tcga_brca_loaders(opt)
+            for client_id, tasks in loaders.items():
+                with self.subTest(client_id=client_id):
+                    train_loader = tasks[0]["train"]
+                    client = ModifiedClient(client_id, opt)
+                    client.register_task(0, train_loader)
+                    for split in ("train", "test"):
+                        labels = torch.cat([labels for _, labels in tasks[0][split]])
+                        self.assertEqual(set(labels.tolist()), set(available_labels))
+                    train_labels = torch.cat([labels for _, labels in train_loader])
+                    torch.testing.assert_close(client.task_label_counts[0], torch.bincount(train_labels, minlength=2))
+                    self.assertEqual((opt.num_classes, opt.nc), (2, 2))
+                    client.eval()
+                    inputs, labels = next(iter(train_loader))
+                    graph_row = torch.eye(opt.num_clients)[client_id].expand(len(labels), -1)
+                    predictions = client.netF(client.netE(inputs, graph_row))
+                    self.assertEqual(tuple(predictions.shape), (len(labels), 2))
+                    loss = F.nll_loss(predictions, labels)
+                    self.assertTrue(torch.isfinite(loss))
+                    loss.backward()
+                    generated = client.netG(torch.zeros(len(labels), opt.noise_dim), labels, graph_row)
+                    self.assertEqual(tuple(generated.shape), (len(labels), opt.nh))
+                    self.assertTrue(torch.isfinite(generated).all())
+
+    def test_tumor_only_download_preserves_label_one_and_two_class_models(self):
+        self.assert_binary_model_for_download((1,))
+
+    def test_normal_only_download_preserves_the_two_class_vocabulary(self):
+        self.assert_binary_model_for_download((0,))
+
+    def test_mixed_download_preserves_both_labels_and_two_class_models(self):
+        self.assert_binary_model_for_download((0, 1))
 
 
 class ExpressionCacheIdentityTest(unittest.TestCase):

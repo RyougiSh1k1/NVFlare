@@ -30,6 +30,20 @@ if PROJECT_DIR not in sys.path:
 from utils.tcia_mri_utils import aggregate_mri_features, load_tcia_mri_features, normalize_training_mri_features
 
 
+def _record_unpickle(marker, value):
+    Path(marker).touch()
+    return value
+
+
+class _PickleProbe:
+    def __init__(self, marker, value):
+        self.marker = str(marker)
+        self.value = value
+
+    def __reduce__(self):
+        return _record_unpickle, (self.marker, self.value)
+
+
 class TCIANormalizationTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -170,6 +184,39 @@ class TCIANormalizationTest(unittest.TestCase):
                 np.savez(path, features=np.asarray([[4, 9], [8, 7]]), **{key: np.asarray([b"patient-1", b"patient-2"])})
                 loaded = load_tcia_mri_features(path)
                 np.testing.assert_array_equal(loaded["patient-1"], [4.0, 9.0])
+
+    def test_npz_rejects_object_arrays(self):
+        for key in ("case_ids", "sample_ids", "ids", "features"):
+            with self.subTest(key=key):
+                arrays = {"ids": np.asarray(["patient-1"]), "features": np.asarray([[4.0, 9.0]])}
+                if key == "features":
+                    arrays[key] = arrays[key].astype(object)
+                else:
+                    arrays = {key: np.asarray(["patient-1"], dtype=object), "features": arrays["features"]}
+                path = self.root / f"object-{key}.npz"
+                np.savez(path, **arrays)
+                with self.assertRaisesRegex(ValueError, "Object arrays cannot be loaded"):
+                    load_tcia_mri_features(path)
+
+    def test_npz_rejects_pickled_objects_before_their_payload_runs(self):
+        for key in ("case_ids", "sample_ids", "ids", "features"):
+            with self.subTest(key=key):
+                marker = self.root / f"unpickled-{key}"
+                arrays = {"ids": np.asarray(["patient-1"]), "features": np.asarray([[4.0, 9.0]])}
+                if key == "features":
+                    arrays[key] = np.asarray([[_PickleProbe(marker, 4.0), 9.0]], dtype=object)
+                else:
+                    arrays = {
+                        key: np.asarray([_PickleProbe(marker, "patient-1")], dtype=object),
+                        "features": arrays["features"],
+                    }
+                path = self.root / f"pickled-{key}.npz"
+                np.savez(path, **arrays)
+                try:
+                    with self.assertRaisesRegex(ValueError, "Object arrays cannot be loaded"):
+                        load_tcia_mri_features(path)
+                finally:
+                    self.assertFalse(marker.exists(), "NPZ loading executed a pickled object")
 
     def test_npz_rejects_bad_shapes_missing_ids_and_nonfinite_values(self):
         invalid = [

@@ -86,9 +86,10 @@ def load_tcia_mri_features(path, id_column=None, normalize=False):
     """Read raw TCIA MRI features without fitting preprocessing to evaluation data.
 
     CSV/TSV requires one ID column and fixed, numeric feature columns. NPZ
-    requires a 2D ``features`` array and 1D ``case_ids``, ``sample_ids`` or
-    ``ids``. Normalize with ``normalize_training_mri_features`` after splitting
-    patients; table-wide normalization is intentionally unsupported.
+    requires a 2D numeric ``features`` array and 1D ``case_ids``, ``sample_ids``
+    or ``ids`` arrays. Store IDs as Unicode or byte strings; pickled object
+    arrays are rejected. Normalize with ``normalize_training_mri_features``
+    after splitting patients; table-wide normalization is unsupported.
     """
     if normalize:
         raise ValueError(
@@ -101,7 +102,7 @@ def load_tcia_mri_features(path, id_column=None, normalize=False):
 
     suffix = Path(path).suffix.lower()
     if suffix == ".npz":
-        with np.load(path, allow_pickle=True) as data:
+        with np.load(path, allow_pickle=False) as data:
             if "features" not in data:
                 raise ValueError("NPZ TCIA MRI features must include features")
             id_key = next((key for key in ("case_ids", "sample_ids", "ids") if key in data), None)

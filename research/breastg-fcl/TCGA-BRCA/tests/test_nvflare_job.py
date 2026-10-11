@@ -110,6 +110,7 @@ class NVFlareJobTest(unittest.TestCase):
             dataloaders=self.loaders,
             server=server,
             dygat=attention,
+            relational_graphs=[np.eye(2, dtype=np.float32) for _ in range(self.opt.num_task)],
             device=torch.device("cpu"),
         )
 

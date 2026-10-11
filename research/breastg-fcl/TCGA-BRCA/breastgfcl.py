@@ -72,8 +72,11 @@ def add_laplace_noise_to_graph(relational_graph, scale, normalize=True):
     if normalize:
         # Normalize rows to sum to 1 (maintain attention property)
         row_sums = noisy_graph.sum(axis=1, keepdims=True)
-        # Avoid division by zero
-        row_sums = np.maximum(row_sums, 1e-8)
+        # Clipping can remove every edge in a row. Use a uniform fallback,
+        # independent of the clean graph, so every client retains graph context.
+        empty_rows = row_sums[:, 0] == 0
+        noisy_graph[empty_rows] = 1.0 / noisy_graph.shape[1]
+        row_sums[empty_rows] = 1.0
         noisy_graph = noisy_graph / row_sums
 
     return noisy_graph.astype(np.float32)
@@ -194,6 +197,8 @@ class ParallelServerGFedCL:
             scale=self.opt.b,
             normalize=True,
         )
+        # Preserve the exact graph consumed by training, replay and evaluation.
+        np.save(os.path.join(graph_dir, f"task_{task + 1}_private.npy"), private_graph)
         noise_magnitude = np.abs(private_graph - clean_graph)
         logger.info(
             "Noise statistics - Mean: %.4f, Max: %.4f, Std: %.4f",
@@ -208,7 +213,8 @@ class ParallelServerGFedCL:
             raise RuntimeError("Training requires an NVFlare transport; launch through job.py")
         logger.info("Starting Parallel Server-based GFedCL training for TCGA-BRCA...")
 
-        relational_graphs = [None for _ in range(self.opt.num_task)]
+        self.relational_graphs = [None for _ in range(self.opt.num_task)]
+        relational_graphs = self.relational_graphs
 
         # Track accuracy for each round and task
         round_accuracy = []

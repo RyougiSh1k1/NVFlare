@@ -71,6 +71,7 @@ class ModifiedClient(nn.Module):
                 {"params": self.netG.parameters(), "lr": getattr(opt, "lr_g", opt.lr_e)},
             ],
             betas=(opt.beta1, getattr(opt, "beta2", 0.999)),
+            weight_decay=getattr(opt, "weight_decay", 0.0),
         )
         self.lr_scheduler_EFG = ExponentialLR(self.optimizer_EFG, gamma=0.5 ** (1 / 100))
         self.loss_names = ["E_pred", "E_gan", "G_pred", "G_gan"]
@@ -276,7 +277,9 @@ class ModifiedClient(nn.Module):
                 correct += (logits.argmax(dim=-1) == labels).sum().item()
                 total += len(labels)
                 total_loss += F.nll_loss(logits, labels, reduction="sum").item()
-        return {"loss": total_loss / total if total else 0.0, "acc": 100.0 * correct / total if total else 0.0}
+        if total == 0:
+            raise ValueError(f"Client {self.client_id}: task {task_id} has no evaluation samples")
+        return {"loss": total_loss / total, "acc": 100.0 * correct / total}
 
     def get_weights(self):
         return {

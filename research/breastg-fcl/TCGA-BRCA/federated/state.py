@@ -62,7 +62,7 @@ def cpu_tree(value):
 
 
 def capture_final_state(workflow, metrics, rounds):
-    """Snapshot all trained state and metrics without retaining live tensors."""
+    """Snapshot trained state, actual task graphs and metrics without live references."""
     return cpu_tree(
         {
             "weights": workflow.clients[0].get_weights(),
@@ -70,6 +70,7 @@ def capture_final_state(workflow, metrics, rounds):
             "discriminator_optimizer": workflow.server.optimizer_D.state_dict(),
             "discriminator_scheduler": workflow.server.lr_scheduler_D.state_dict(),
             "graph_state": workflow.dygat.state_dict(),
+            "relational_graphs": workflow.relational_graphs,
             "training_states": [client.get_training_state() for client in workflow.clients],
             "metrics": metrics,
             "rounds": rounds,

@@ -104,10 +104,13 @@ below create an isolated Conda environment. CPU execution is supported for
 the synthetic smoke test and real-data workflow. CUDA training needs
 a compatible NVIDIA driver and PyTorch build.
 
-The recorded NVFlare experiments used Python 3.10.12, PyTorch 2.2.1+cu118,
-and one NVIDIA GeForce RTX 3090 (24 GB) per run, shared by the server and
-four clients. Real-data execution also needs the downloaded expression
-files, clinical metadata, and TCIA feature tables described below.
+The 2026-10-10 validation used the `breastgfcl` Miniconda environment with
+Python 3.10.22 and PyTorch 2.5.1 (CUDA 12.4). Each real-data run used one
+NVIDIA GeForce RTX 3090 (24 GB), shared by the server and four clients.
+The earlier parameter search used an older environment; both are listed
+under [Requirements](#requirements). Real-data execution also needs the
+downloaded expression files, clinical metadata, and TCIA feature tables
+below.
 
 ```bash
 git clone https://github.com/NVIDIA/NVFlare.git
@@ -203,6 +206,9 @@ The split is stratified by each patient's label combination: Normal only,
 Tumor only, or both. All expression files from a patient stay on the same
 side, including multiple files for one sample and paired Normal/Tumor
 samples. The fraction of expression records need not be exactly 80/20.
+Set `--train-split` to change the training patient fraction; evaluation uses
+the remaining patients. Fractions are approximate after stratification and
+rounding. The unused `--test-split` option has been removed.
 
 Within each side, records are assigned to clinical-stage tasks and then
 four clients; Normal records are distributed across tasks. The `random`
@@ -279,6 +285,7 @@ python TCGA-BRCA/job.py \
   --nh 800 --noise-dim 100 --batch-size 32 \
   --replay true --lambda-gan 0.1 \
   --lr-e 3e-5 --lr-f 3e-4 --lr-g 3e-5 --lr-d 1e-3 \
+  --weight-decay 0.0 \
   --p 0.1 --no-bn true --shuffle false \
   --sensitivity 1.0 --epsilon 1.0 \
   --output-dir TCGA-BRCA/dump/nvflare_selected_seed42
@@ -293,6 +300,7 @@ python TCGA-BRCA/job.py \
 | Graph row / discriminator output dimension | 4 (client count) | 4 |
 | Batch size | 32 | 32 |
 | Learning rates `E / F / G / D` | `1e-4 / 1e-4 / 1e-4 / 1e-4` | `3e-5 / 3e-4 / 3e-5 / 1e-3` |
+| Adam weight decay, `E/F/G/D` | 0 | 0 |
 | `lambda_gan` | 0.5 | 0.1 |
 | Dropout `p` | 0.2 | 0.1 |
 | `no_bn` | `true` | `true` |
@@ -301,6 +309,12 @@ python TCGA-BRCA/job.py \
 
 Despite its name, `--no-bn true` disables the encoder's **LayerNorm**.
 `--shuffle false` changes training batch order, not the data partition.
+`--weight-decay` now applies to every client `E/F/G` Adam parameter group
+and the server `D` optimizer. Its default is `0`, preserving the previous
+effective behavior: the old CLI displayed `1e-4`, but did not pass that value
+to Adam. A positive value explicitly enables weight decay and changes the
+training updates. Encoder and generator graph conditioning is required;
+the unused `--use-g-encode` switch has been removed.
 Graph dimensions follow `--num-clients`; `--nt` and `--nd-out` are
 compatibility options. All defaults are in
 [TCGA_BRCA.py](TCGA-BRCA/configs/TCGA_BRCA.py).
@@ -346,6 +360,7 @@ OUTPUT_DIR/
 │   ├── task_<k>_temporal.npy
 │   ├── task_<k>_temporal_window.npy
 │   ├── task_<k>_fused.npy
+│   ├── task_<k>_private.npy
 │   └── task_<k>_attention.pt
 ├── simulator.log
 ├── nvflare_job/
@@ -355,9 +370,24 @@ OUTPUT_DIR/
 ```
 
 `final_state.pt` includes model and attention state, client/server optimizer
-and scheduler state, replay metadata, and metrics. Simulator/site logs live
-in the job workspace; `simulator.log` captures the simulator console. Export-only
-runs produce the job without training results.
+and scheduler state, replay metadata, metrics, and the task-indexed
+`relational_graphs` used by training and evaluation. Each `task_<k>_private.npy`
+contains the same post-noise graph; `task_<k>_fused.npy` retains the clean graph
+for auditing. With the same configuration and evaluation data, restore model
+weights and use the saved `relational_graphs` to reproduce predictions without
+sampling noise again. Simulator/site logs live in the job workspace;
+`simulator.log` captures the simulator console. Export-only runs produce the
+job without training results.
+
+To plot the round-accuracy CSV, including smoke runs with two rounds per task:
+
+```bash
+python TCGA-BRCA/visualize.py --csv_path OUTPUT_DIR/round_accuracy.csv --output_path curve.png
+```
+
+Task endpoints are labeled by actual cumulative round counts, including
+unequal task lengths. A basename such as `curve.png` saves in the current
+directory; parent directories are created when a nested path is supplied.
 
 #### CPU smoke test
 
@@ -389,10 +419,18 @@ and metric files listed above. The CPU smoke test produces the same kinds
 of training artifacts from its synthetic fixture. Smoke-test accuracy is
 only a diagnostic of the synthetic workflow, not an expected TCGA score.
 
-With client-side latent perturbation enabled, the current NVFlare 2.9.0
-Collab CPU smoke completed all six rounds across four clients and three
-tasks, with replay enabled. The final model, optimizer, scheduler, replay,
-and graph artifacts were finite, and both metric CSV files were produced.
+Validation on 2026-10-10 passed all **171 regression tests** in the
+`breastgfcl` environment. Scoped Black, isort, and flake8 checks, the example's
+license-header check, and `pip check` also passed.
+
+The NVFlare 2.9.0 Collab CPU smoke completed all six rounds across four
+client processes and three tasks, with replay and client-side latent
+perturbation enabled. It exited successfully with no errors or warnings.
+Model, optimizer, scheduler, replay, and graph artifacts were finite, and
+both metric CSV files contained six rounds. Each saved private graph
+matched its checkpoint entry; restoring the models and graphs reproduced
+all 12 client/task accuracies. Plotting this smoke CSV with a basename-only
+output path succeeded and labeled task endpoints as 2, 4, and 6.
 
 Before latent perturbation moved to clients, an NVFlare 2.9.0 Collab CPU
 smoke run completed four clients, three tasks, two rounds per task, and one
@@ -405,11 +443,19 @@ fixture; it does not establish TCGA accuracy.
 
 ### Recorded NVFlare experiment
 
+The final evaluation below was rerun on **2026-10-10** after the review
+fixes, including stable prediction log probabilities, graph normalization,
+and persistence of the actual noisy training graphs. The three final
+training seeds used the previously selected configuration. The earlier
+parameter search and its validation results remain historical; that search
+was not repeated for this rerun.
+
 These measurements use the NVFlare 2.9.0 Collab implementation with
 patient-separated partitions, training-fitted expression/TCIA normalization,
 client-side latent perturbation, and expression-cache schema v3. Each run
-completed four clients, three tasks, and ten rounds per task with replay
-enabled. Evaluation uses the final Task 3 / Round 10 checkpoint.
+completed four clients, three tasks, ten rounds per task, and three local
+epochs per round with replay enabled. Evaluation uses the final
+Task 3 / Round 10 checkpoint.
 
 #### Parameter selection and fixed data
 
@@ -419,7 +465,7 @@ and 225 evaluation records from 201 patients. Patient and sample identities
 are disjoint across the two sides. The 225 evaluation records contain
 23 Normal and 202 Tumor records.
 
-Parameter selection used only the original training side:
+The historical parameter selection used only the original training side:
 
 1. Split its patients again with split seed 2026, retaining the original
    task/client assignments: 674 internal-training records and 220 validation
@@ -444,7 +490,7 @@ Parameter selection used only the original training side:
    prepared inputs and the original 225-record evaluation side. Report all
    three seeds without further parameter or checkpoint selection.
 
-This produced 33 completed runs: 24 screening runs, six additional
+That study produced 33 completed runs: 24 screening runs, six additional
 confirmation runs, and three final refits. The selected configuration uses
 `lr_e = lr_g = 3e-5`; the complete settings and launch command are
 [above](#selected-development-configuration). It tied another candidate on
@@ -455,14 +501,29 @@ and macro F1 97.37%.
 
 #### Final evaluation results
 
-The table pools predictions across all 225 evaluation records:
+For the 2026-10-10 rerun, all 1,231 expression files were downloaded against
+the repository's frozen manifest and verified by size and MD5; all five
+TCIA source artifacts passed SHA-256 checks. The seed-42 preparation
+reproduced the documented cohort counts above. Its normalized tensors,
+patient/task/client assignments, and TCIA summaries were then frozen and
+reused for training seeds 42, 43, and 44. Each seed started with fresh
+models, attention parameters, optimizers, and random state. Input and
+partition hashes matched across all three runs. No parameters or
+checkpoints were selected using the outer evaluation results.
 
-| Training seed | Accuracy (%) | Balanced accuracy (%) | Normal recall (%) | Tumor recall (%) | Macro F1 (%) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 42 | 97.33 | 88.88 | 78.26 | 99.50 | 92.12 |
-| 43 | 97.33 | 88.88 | 78.26 | 99.50 | 92.12 |
-| 44 | 97.33 | 88.88 | 78.26 | 99.50 | 92.12 |
-| Mean ± sample standard deviation | 97.33 ± 0.00 | 88.88 ± 0.00 | 78.26 ± 0.00 | 99.50 ± 0.00 | 92.12 ± 0.00 |
+The rerun pools predictions across the same 225-record evaluation population
+for all three seeds. The five classification metrics match the historical
+final table at the displayed precision:
+
+| Training seed | Accuracy (%) | Balanced accuracy (%) | Normal recall (%) | Tumor recall (%) | Macro F1 (%) | AUROC |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 97.33 | 88.88 | 78.26 | 99.50 | 92.12 | 0.9759 |
+| 43 | 97.33 | 88.88 | 78.26 | 99.50 | 92.12 | 0.9707 |
+| 44 | 97.33 | 88.88 | 78.26 | 99.50 | 92.12 | 0.9856 |
+| Mean ± sample standard deviation | 97.33 ± 0.00 | 88.88 ± 0.00 | 78.26 ± 0.00 | 99.50 ± 0.00 | 92.12 ± 0.00 | 0.9774 ± 0.0075 |
+
+AUROC is on a 0–1 scale and uses the Tumor log odds, with average ranks for
+tied scores.
 
 For each seed, the confusion matrix is `[[18, 5], [1, 201]]`, with rows as
 true labels, columns as predicted labels, and class order Normal/Tumor.
@@ -472,16 +533,24 @@ scores. The simulator's `overall_avg_acc` instead averages the 12
 client/task cell accuracies equally and is **96.90%** for each final run;
 it is a different aggregation from the pooled **97.33%** above.
 
-Post-training evaluation restored the saved encoder/predictor and the same
-perturbed graph rows used during training. Recomputed accuracies matched
-all 12 saved cell results. All runs completed their configured updates with
-finite checkpoint states and logged losses. The maximum logged `D` loss
-across the three final runs was 0.2807; final values for seeds 42/43/44 were
-0.1417/0.1272/0.1104. Loss magnitude alone does not establish convergence.
+Post-training evaluation restored each saved encoder/predictor and the
+actual perturbed graph rows on CPU. Recomputed accuracies matched all
+**36 saved client/task results** across the three seeds. All 90 training
+rounds completed with finite checkpoint states and logged losses, and no
+errors or warnings appeared in the simulator or site logs. Training-only
+expression and TCIA normalization statistics were independently recomputed
+and matched the saved statistics and prepared tensors.
 
-The three runs have distinct trained model weights despite their identical
-classification metrics. Sample standard deviation describes training-seed
-variation on this fixed cohort, not a patient-level confidence interval.
+Each client's Adam state recorded 240 updates and its scheduler 90 steps;
+the server optimizer and scheduler each recorded 30 steps. Every run saved
+18 graph artifacts and 30 rows in each metric CSV. The maximum logged `D`
+loss across the three runs was 0.2807; final values for seeds 42/43/44 were
+0.1417/0.1273/0.1104. Loss magnitude alone does not establish convergence.
+
+The three runs have distinct trained model weights and AUROCs despite their
+identical hard-classification metrics. Sample standard deviation describes
+training-seed variation on this fixed cohort, not a patient-level confidence
+interval.
 There are only 23 Normal evaluation records. Multiple expression files
 remain separate records within their assigned patient side.
 
@@ -494,7 +563,8 @@ These results also do not reproduce the paper's original experimental
 protocol. Historical results using overlapping file-level partitions and
 full-cohort normalization are superseded here and are not comparable.
 
-The search/evaluation drivers, frozen prepared tensors, and full experiment
+The search and fixed-partition rerun/evaluation drivers, frozen prepared
+tensors, per-record predictions, environment records, and full experiment
 bundles are local experiment artifacts and are not included in this
 contribution. The public launch command runs the selected configuration;
 exact replay of the fixed-partition search and multiple-seed table requires
@@ -527,17 +597,20 @@ The project dependency specifications are [requirements.txt](requirements.txt)
 and [environment.yml](environment.yml). NVFlare is pinned to **2.9.0** for
 the Collab API and `CollabRecipe`/`SimEnv` integration.
 
-The local environment for the Collab workflow has these installed versions:
+The completed validations used these installed versions:
 
-| Dependency | Installed version |
-| --- | --- |
-| Python | 3.10.12 |
-| NVFlare | 2.9.0 |
-| PyTorch | 2.2.1+cu118 |
-| NumPy | 1.26.4 |
+| Dependency | Historical search | 2026-10-10 validation and final rerun |
+| --- | --- | --- |
+| Python | 3.10.12 | 3.10.22 |
+| NVFlare | 2.9.0 | 2.9.0 |
+| PyTorch | 2.2.1+cu118 | 2.5.1 (CUDA 12.4) |
+| NumPy | 1.26.4 | 2.2.6 |
 
+The new run validates the corrected implementation in the recorded
+Miniconda environment; it does not establish bitwise equivalence with
+historical models trained under the older dependencies.
 The requirements files allow broader versions for several packages; they
-are not an exact lockfile for this environment. Spreadsheet readers
+are not exact lockfiles for these environments. Spreadsheet readers
 `openpyxl==3.1.5` and `xlrd==2.0.2` support the TCIA source workbooks.
 
 ## Citation

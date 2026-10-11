@@ -40,6 +40,9 @@ side, including multiple files for the same sample and paired Normal/Tumor
 samples. Clinical-stage tasks and client assignments are constructed
 separately within each side. The `random` task strategy follows the same
 global patient split.
+`--train-split` sets the training fraction (default `0.8`); evaluation uses
+the remaining patients, subject to stratification and rounding. The unused
+`--test-split` flag is no longer accepted.
 
 Partition validation rejects overlapping train/test patient or sample IDs
 and duplicate record-index assignments. It also requires nonempty train
@@ -139,6 +142,13 @@ server takes one `D` optimizer step per communication round. The joint Adam opti
 has separate parameter groups controlled by `--lr-e`, `--lr-f`, and
 `--lr-g`; the server uses `--lr-d`. All four default to `1e-4`.
 
+`--weight-decay` controls Adam weight decay for all three client parameter
+groups and the server discriminator. It defaults to `0.0`, preserving the
+previous effective Adam setting; the old advertised `1e-4` was never wired
+into either optimizer. Nonzero values now change the updates. Values must
+be finite and nonnegative. Graph rows are required by both `E` and `G`, so
+the unused `--use-g-encode` toggle has been removed.
+
 The new encoder has no label embedding, and `GNet` now generates latents
 instead of graph embeddings. Old `E/G` checkpoints therefore cannot be
 loaded directly into these architectures; start a new run or provide an
@@ -178,8 +188,13 @@ divides the spatial and temporal scores before their respective softmaxes;
 the equations above show the default temperature of `1.0`.
 
 Each task writes its spatial attention, temporal attention, temporal-window
-input, and fused graph to `OUTPUT_DIR/relational_graphs/*.npy` for auditing.
-It also saves `task_<k>_attention.pt` in that directory, containing the
+input, and clean fused graph to `OUTPUT_DIR/relational_graphs/*.npy` for auditing.
+The exact post-noise graph used in training, replay, and evaluation is saved as
+`task_<k>_private.npy` and in `final_state.pt` under `relational_graphs`. After
+clipping negative graph entries, zero-sum rows fall back to uniform weights;
+all rows are then normalized. Use these saved task graphs when restoring
+model weights for evaluation instead of sampling graph noise again.
+Each task also saves `task_<k>_attention.pt` in that directory, containing the
 attention `state_dict` (including DCE history in extra state) and
 `network_config` (dimensions, window, temperature, epsilon, and related
 settings).
@@ -271,10 +286,10 @@ uses `lr_e = lr_g = 3e-5`, `lr_f = 3e-4`, `lr_d = 1e-3`,
 `lambda_gan = 0.1`, and 3 local epochs per round. It retains 4 clients,
 3 tasks, 10 rounds per task, latent width 800, noise width 100, batch size 32,
 and replay. Its other overrides are `p = 0.1` and `shuffle = false`, with
-`no_bn = true` and `sensitivity = epsilon = 1.0`. These experiment settings
-do not change the runtime defaults.
+`no_bn = true`, `weight_decay = 0.0`, and `sensitivity = epsilon = 1.0`.
+These experiment settings do not change the runtime defaults.
 
-The [recorded NVFlare experiment](../README.md#recorded-nvflare-experiment)
+The original [recorded NVFlare experiment](../README.md#recorded-nvflare-experiment)
 used NVFlare 2.9.0 Collab with the patient/sample separation and
 training-fitted normalization described above. It froze the original
 seed-42 partition of 894 training records and 225 outer-evaluation records.
@@ -283,21 +298,42 @@ training records and 220 validation records. During search, normalization
 was fitted and graph summaries were computed using only the 674 training
 records; final refitting used all 894 training records for these steps.
 
-The search evaluated 24 configurations with training seed 42, confirmed the
-top three with seeds 43 and 44 while reusing their seed-42 runs, and then
-trained the locked configuration afresh on all 894 records with seeds
-42, 43, and 44. These 33 successful runs kept their respective prepared
+The original search evaluated 24 configurations with training seed 42,
+confirmed the top three with seeds 43 and 44 while reusing their seed-42
+runs, then trained the locked configuration afresh on all 894 records
+with seeds 42, 43, and 44. These 33 successful runs kept their respective prepared
 data partitions fixed across training seeds. The 225 outer-evaluation
 records and their metrics were not used for selection during this search.
 This outer split had been inspected in earlier experiments, so the final
 results are not a new, previously unseen blind test.
 
-Across the three final refits, pooled accuracy was **97.33%**, balanced
-accuracy **88.88%**, Normal recall **78.26%**, Tumor recall **99.50%**, and
-macro F1 **92.12%**. The simulator's unweighted mean accuracy over the
-12 client/task cells was **96.90%**; it is a different aggregation from
-pooled accuracy. See the recorded experiment for per-seed results and
-limitations.
+On 2026-10-10, the code with the review fixes reran the locked configuration
+from fresh models and optimizers for training seeds **42, 43, and 44**.
+Data were prepared with seed 42, then the resulting inputs and partition
+were held fixed across these three runs. The earlier screening and
+confirmation runs were not repeated; outer evaluation was not used for
+retuning or checkpoint selection. All **90 rounds** finished.
+Restoring the final models and their saved noisy task graphs on CPU
+reproduced all **36 client/task accuracy cells** across the three runs.
+
+In these reruns, pooled accuracy was **97.33%**, balanced accuracy **88.88%**,
+Normal recall **78.26%**, Tumor recall **99.50%**, and macro F1 **92.12%**
+for each seed, matching the original final table at its displayed precision.
+The trained weights differed across seeds; mean AUROC was **0.9774** with
+sample standard deviation **0.0075**. The simulator's unweighted mean
+accuracy over the 12 client/task cells was **96.90%**; it is a different
+aggregation from pooled accuracy. These seeds measure training variation
+on one fixed cohort, not patient-level uncertainty. The existing outer
+split remains previously inspected, and this does not establish an exact
+reproduction of the paper. See the recorded experiment for per-seed results
+and the remaining implementation limitations.
+
+The reruns used the `breastgfcl` Miniconda environment with Python **3.10.22**,
+PyTorch **2.5.1** (CUDA **12.4**), NumPy **2.2.6**, and NVFlare **2.9.0**.
+This differs from the original recorded environment and does not claim
+bitwise reproduction of its models. The same corrected implementation
+passed **171 regression tests** and the multiprocess CPU smoke described
+below; see [validation results](../README.md#expected-results).
 
 The standard launcher uses `--seed` for both data preparation and training.
 Changing it on each CLI run also changes the patient/task/client partition,
@@ -322,12 +358,18 @@ Its metrics are not comparable with the paper's reported results.
 
 A completed smoke test writes the model and graph checkpoints, metric files,
 and simulator logs described below. Inspect these artifacts to verify that
-the synthetic task sequence finished in your environment. The current run
-with client-side latent noise completed all six rounds with replay, finite
-checkpoint and graph values, and both metric CSV files. Before latent
-perturbation moved to clients, the recorded Collab smoke run matched the
-previous Controller implementation's model and training state, graph
-artifacts, and metric CSV files exactly; see the historical
+the synthetic task sequence finished in your environment. On 2026-10-10,
+the corrected implementation completed all six rounds with replay using
+actual Collab/SimEnv processes and four resident clients. The launcher
+exited successfully, both metric CSV files had six aligned rows, and all
+checkpoint and graph values were finite. Restoring the model and saved
+noisy graphs reproduced all **12 client/task accuracy cells**. Simulator
+and site logs contained no warnings or errors, and the workers exited
+normally. The resulting plot used the actual task endpoints **2, 4, 6**.
+
+Before latent perturbation moved to clients, the recorded Collab smoke run
+matched the previous Controller implementation's model and training
+state, graph artifacts, and metric CSV files exactly; see the historical
 [migration validation](../README.md#expected-results). That comparison
 covers the transport migration before the client-side noise change and
 does not measure TCGA accuracy.

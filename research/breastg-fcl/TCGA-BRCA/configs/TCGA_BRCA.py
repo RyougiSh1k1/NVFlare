@@ -36,6 +36,7 @@
 # SOFTWARE.
 
 import argparse
+import math
 import os
 from datetime import datetime
 
@@ -105,10 +106,12 @@ def build_parser():
     parser.add_argument("--pin-memory", type=_str2bool, default=False)
     parser.add_argument("--num-workers", type=int, default=0)
 
-    parser.add_argument("--train-split", type=float, default=0.8)
-    parser.add_argument("--test-split", type=float, default=0.2)
-
-    parser.add_argument("--use-g-encode", type=_str2bool, default=True)
+    parser.add_argument(
+        "--train-split",
+        type=float,
+        default=0.8,
+        help="Training patient fraction in (0, 1); remaining patients are used for evaluation.",
+    )
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lambda-gan", type=float, default=0.5)
@@ -120,7 +123,12 @@ def build_parser():
     parser.add_argument("--gamma", type=float, default=1000)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.999)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help="Adam weight decay for client E/F/G and server D (default: 0, matching prior effective behavior).",
+    )
     parser.add_argument("--shuffle", type=_str2bool, default=True)
 
     parser.add_argument("--gat-rounds", type=int, default=10)
@@ -187,6 +195,11 @@ def build_parser():
 
 
 def finalize_opt(opt):
+    if not math.isfinite(opt.train_split) or not 0 < opt.train_split < 1:
+        raise ValueError("--train-split must be finite and strictly between 0 and 1")
+    if not math.isfinite(opt.weight_decay) or opt.weight_decay < 0:
+        raise ValueError("--weight-decay must be finite and nonnegative")
+
     opt.train = not opt.debug
     if opt.device == "cuda" and not torch.cuda.is_available():
         opt.device = "cpu"

@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import tarfile
 import tempfile
 import time
@@ -192,13 +193,25 @@ def chunked(items: list[str], size: int) -> list[list[str]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
+def download_target(raw_dir: Path, file_id: str, filename: str) -> Path:
+    """Keep manifest paths and existing symlinks within the download directory."""
+    for field, value in (("file_id", file_id), ("file_name", filename)):
+        if not isinstance(value, str) or value in ("", ".", "..") or "/" in value or "\\" in value:
+            raise ValueError(f"Invalid manifest {field}: expected a single path component")
+    root = raw_dir.resolve()
+    target = (root / file_id / filename).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError(f"Manifest target escapes the download directory: {file_id}/{filename}")
+    return target
+
+
 def file_matches_manifest(hit: dict, raw_dir: Path) -> bool:
     """Check the actual expression file; a download ledger is not evidence."""
     file_id = hit.get("file_id", hit.get("id"))
     filename = hit.get("file_name")
     if not file_id or not filename:
         return False
-    path = raw_dir / file_id / filename
+    path = download_target(raw_dir, file_id, filename)
     if not path.is_file() or path.stat().st_size != int(hit["file_size"]):
         return False
     expected_md5 = hit.get("md5sum")
@@ -217,20 +230,30 @@ def save_downloaded(path: Path, downloaded: set[str]) -> None:
         json.dump(sorted(downloaded), handle, indent=2)
 
 
-def extract_download_tar(tar_path: Path, raw_dir: Path) -> list[str]:
+def extract_download_tar(tar_path: Path, raw_dir: Path, expected_files: dict[str, str]) -> list[str]:
+    """Stream only requested GDC files, without applying archive paths or metadata."""
     extracted_ids: list[str] = []
     with tarfile.open(tar_path, "r:gz") as archive:
         for member in archive.getmembers():
+            if member.isdir():
+                continue
             if not member.isfile():
+                raise ValueError(f"Unsupported archive member: {member.name}")
+            parts = member.name.split("/")
+            if "\\" in member.name or any(part in ("", ".", "..") for part in parts):
+                raise ValueError(f"Unsafe archive member path: {member.name}")
+            # GDC also includes top-level metadata such as MANIFEST.txt.
+            if len(parts) == 1:
                 continue
-            parts = Path(member.name).parts
-            if len(parts) < 2:
-                continue
-            file_id = parts[0]
-            target_dir = raw_dir / file_id
-            target_dir.mkdir(parents=True, exist_ok=True)
-            member.name = parts[-1]
-            archive.extract(member, target_dir)
+            if len(parts) != 2:
+                raise ValueError(f"Unexpected archive member path: {member.name}")
+            file_id, filename = parts
+            if expected_files.get(file_id) != filename:
+                raise ValueError(f"Archive member is not in the requested manifest: {member.name}")
+            target = download_target(raw_dir, file_id, filename)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(member) as source, target.open("wb") as destination:
+                shutil.copyfileobj(source, destination)
             extracted_ids.append(file_id)
     return extracted_ids
 
@@ -268,7 +291,7 @@ def download_files(
                 for block in response.iter_content(chunk_size=1024 * 1024):
                     if block:
                         handle.write(block)
-            extract_download_tar(tmp_path, raw_dir)
+            extract_download_tar(tmp_path, raw_dir, {file_id: files_by_id[file_id]["file_name"] for file_id in ids})
         finally:
             tmp_path.unlink(missing_ok=True)
 

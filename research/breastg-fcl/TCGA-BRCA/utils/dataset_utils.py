@@ -571,7 +571,8 @@ def setup_tcga_brca_loaders(opt):
 
     records = _read_manifest(manifest_path, raw_dir)
     targets = np.asarray([record["label"] for record in records], dtype=np.int64)
-    opt.num_classes = int(len(set(targets.tolist())))
+    # Keep the fixed Normal/Tumor vocabulary when only one class was downloaded.
+    opt.num_classes = len(LABEL_MAP)
     opt.nc = opt.num_classes
 
     if getattr(opt, "task_split_strategy", "clinical_stage") == "clinical_stage":

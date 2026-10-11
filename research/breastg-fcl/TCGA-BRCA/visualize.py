@@ -41,10 +41,10 @@ GFedCL Training Curve Visualization Script
 
 This script reads the accuracy data from round_accuracy.csv and
 creates a visualization of the training curve with numeric labels
-only at the end of each task (10, 20, 30, 40).
+only at the cumulative round count at the end of each task.
 
 Usage:
-    python visualize_training_curve.py
+    python visualize.py
 """
 
 import argparse
@@ -161,10 +161,10 @@ def visualize_training_curve(csv_path, output_path, figsize=(12, 6), dpi=300):
     # Create empty labels initially
     tick_labels = ["" for _ in range(len(round_accuracy))]
 
-    # Add labels only at task end points (10, 20, 30, 40)
-    for i, end_point in enumerate(task_end_points):
+    # Label the actual cumulative round count at each task end point.
+    for end_point in task_end_points:
         if end_point > 0:  # Make sure it's a valid position
-            tick_labels[end_point - 1] = str((i + 1) * 10)  # Label as 10, 20, 30, 40
+            tick_labels[end_point - 1] = str(end_point)
 
     # Set tick positions and labels
     plt.xticks(tick_positions, tick_labels)
@@ -181,7 +181,9 @@ def visualize_training_curve(csv_path, output_path, figsize=(12, 6), dpi=300):
     plt.tight_layout()
 
     # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     # Save the figure
     plt.savefig(output_path, bbox_inches="tight", dpi=dpi)
