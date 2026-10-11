@@ -183,6 +183,39 @@ class TrainingComponentsTest(unittest.TestCase):
             self.assertFalse(parameter.requires_grad)
             self.assertIsNone(parameter.grad)
 
+    def test_registered_task_rejects_empty_training_without_state_updates(self):
+        self.client.learn(0, 0, self.graphs, self.loader)
+        weights = self.client.get_weights()
+        state = self.client.get_training_state()
+        empty = DataLoader(
+            TensorDataset(torch.empty(0, self.opt.input_dim), torch.empty(0, dtype=torch.long)), batch_size=4
+        )
+        for loader in (empty, iter(())):
+            with self.subTest(loader_type=type(loader).__name__):
+                with self.assertRaisesRegex(ValueError, r"Client 0: task 0.*no training batches"):
+                    self.client.learn(1, 0, self.graphs, loader)
+                self.assert_nested_equal(self.client.get_weights(), weights)
+                self.assert_nested_equal(self.client.get_training_state(), state)
+
+    def test_registration_consuming_one_shot_iterator_cannot_report_training_success(self):
+        optimizer = copy.deepcopy(self.client.optimizer_EFG.state_dict())
+        scheduler = copy.deepcopy(self.client.lr_scheduler_EFG.state_dict())
+        weights = self.client.get_weights()
+
+        with self.assertRaisesRegex(ValueError, r"Client 0: task 0.*no training batches"):
+            self.client.learn(0, 0, self.graphs, iter(self.loader))
+
+        self.assert_nested_equal(self.client.get_weights(), weights)
+        self.assert_nested_equal(self.client.optimizer_EFG.state_dict(), optimizer)
+        self.assert_nested_equal(self.client.lr_scheduler_EFG.state_dict(), scheduler)
+
+    def test_unregistered_empty_task_is_rejected_without_recording_replay_metadata(self):
+        with self.assertRaisesRegex(ValueError, r"Client 0: task 1 has no training samples"):
+            self.client.learn(0, 1, self.graphs, iter(()))
+        self.assertNotIn(1, self.client.task_label_counts)
+        self.assertNotIn(1, self.client.task_batch_sizes)
+        self.assertFalse(self.client.optimizer_EFG.state)
+
     def test_adversarial_loss_backpropagates_through_frozen_discriminator(self):
         self.client.eval()
         graph_rows = torch.tensor(self.graphs[0][0]).expand(4, -1)

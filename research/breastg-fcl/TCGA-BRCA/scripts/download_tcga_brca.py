@@ -190,6 +190,8 @@ def write_manifest(files: list[dict], path: Path) -> None:
 
 
 def chunked(items: list[str], size: int) -> list[list[str]]:
+    if size <= 0:
+        raise ValueError("chunk size must be a positive integer")
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
@@ -266,6 +268,8 @@ def download_files(
     chunk_size: int,
     pause_seconds: float,
 ) -> None:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
     downloaded_path = metadata_dir / "downloaded_files.json"
     file_ids = [hit.get("file_id", hit.get("id")) for hit in files]
     files_by_id = {hit.get("file_id", hit.get("id")): hit for hit in files}
@@ -313,7 +317,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=25)
     parser.add_argument("--pause-seconds", type=float, default=0.5)
     parser.add_argument("--metadata-only", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.chunk_size <= 0:
+        parser.error("--chunk-size must be a positive integer")
+    return args
 
 
 def main() -> None:

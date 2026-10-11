@@ -37,10 +37,12 @@
 
 """Offline coverage of GDC download validation and resume behavior."""
 
+import contextlib
 import hashlib
 import importlib.util
 import io
 import json
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -113,6 +115,52 @@ class DownloadTCGABRCATest(unittest.TestCase):
 
     def completed_ids(self):
         return json.loads(self.ledger.read_text())
+
+    def test_invalid_chunk_size_cli_fails_before_filesystem_or_network_access(self):
+        root = Path(self.directory.name) / "new-download-root"
+        for size in (-1, 0):
+            with self.subTest(size=size):
+                argv = [str(SCRIPT), "--root", str(root), "--chunk-size", str(size)]
+                error = io.StringIO()
+                with patch.object(sys, "argv", argv), patch.object(downloader.requests, "Session") as session:
+                    with contextlib.redirect_stderr(error), self.assertRaises(SystemExit) as raised:
+                        downloader.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("--chunk-size must be a positive integer", error.getvalue())
+                session.assert_not_called()
+                self.assertFalse(root.exists())
+
+    def test_invalid_download_chunk_size_preserves_ledger_before_any_side_effect(self):
+        sentinel = b'["preserve-existing-ledger"]\n'
+        for size in (-1, 0):
+            for files in ([self.hit], []):
+                for existing_ledger in (False, True):
+                    with self.subTest(size=size, files=files, existing_ledger=existing_ledger):
+                        self.ledger.unlink(missing_ok=True)
+                        if existing_ledger:
+                            self.ledger.write_bytes(sentinel)
+                        with patch.object(downloader, "file_matches_manifest") as matches:
+                            with self.assertRaisesRegex(ValueError, "chunk_size must be a positive integer"):
+                                downloader.download_files(
+                                    self.session, files, self.raw_dir, self.metadata_dir, size, pause_seconds=0
+                                )
+                        matches.assert_not_called()
+                        self.session.post.assert_not_called()
+                        self.assertEqual(list(self.raw_dir.iterdir()), [])
+                        if existing_ledger:
+                            self.assertEqual(self.ledger.read_bytes(), sentinel)
+                        else:
+                            self.assertFalse(self.ledger.exists())
+
+    def test_chunked_requires_positive_size_and_preserves_positive_batching(self):
+        for size in (-1, 0):
+            for items in ([], ["a", "b"]):
+                with self.subTest(size=size, items=items):
+                    with self.assertRaisesRegex(ValueError, "chunk size must be a positive integer"):
+                        downloader.chunked(items, size)
+        self.assertEqual(downloader.chunked(["a", "b", "c"], 1), [["a"], ["b"], ["c"]])
+        self.assertEqual(downloader.chunked(["a", "b", "c"], 2), [["a", "b"], ["c"]])
+        self.assertEqual(downloader.chunked(["a", "b", "c"], 25), [["a", "b", "c"]])
 
     def test_regular_files_are_streamed_without_extracting_archive_metadata(self):
         member = tarfile.TarInfo(f'{self.hit["file_id"]}/{self.hit["file_name"]}')

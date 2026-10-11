@@ -47,7 +47,6 @@ import tempfile
 from pathlib import Path
 
 import torch
-from configs.TCGA_BRCA import build_parser, finalize_opt
 from federated.client import BreastGFCLClient
 from federated.server import BreastGFCLServer
 from prepare_data import prepare_bundles
@@ -104,6 +103,47 @@ def export_job(job_dir, server_bundle, site_bundles):
     return job_dir / JOB_NAME
 
 
+def configure_cuda(device, gpu):
+    """Select physical GPUs before importing configuration or querying CUDA.
+
+    Without an explicit selection, preserve the inherited mask and ordering;
+    NVFlare workers must then inherit them too, including UUID/MIG masks.
+    """
+    if device not in (None, "cpu", "cuda"):
+        raise ValueError("--device must be 'cpu' or 'cuda'; select physical GPUs with --nvflare-gpu")
+    if torch.cuda.is_initialized():
+        raise ValueError("CUDA is already initialized; launch job.py in a fresh interpreter to select devices safely")
+    if device == "cpu":
+        if gpu is not None:
+            raise ValueError("--nvflare-gpu requires --device cuda")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        return None
+    if gpu is None:
+        return None
+    gpu = gpu.replace(" ", "")
+    if re.fullmatch(r"[0-9]+|\[[0-9]+(?:,[0-9]+)*\]", gpu) is None:
+        raise ValueError("--nvflare-gpu must select one GPU or one shared GPU group, e.g. '1' or '[1,2]'")
+    selected = [str(int(value)) for value in gpu.strip("[]").split(",")]
+    if len(set(selected)) != len(selected):
+        raise ValueError("--nvflare-gpu must not contain duplicate GPU IDs")
+    inherited = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if inherited is not None:
+        allowed = inherited.replace(" ", "").split(",")
+        if (
+            os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID"
+            or not all(value.isdecimal() for value in allowed)
+            or not set(selected).issubset({str(int(value)) for value in allowed})
+        ):
+            raise ValueError(
+                "--nvflare-gpu conflicts with or cannot safely interpret inherited CUDA_VISIBLE_DEVICES; "
+                "omit --nvflare-gpu to preserve the inherited selection, or use a compatible numeric mask "
+                "with CUDA_DEVICE_ORDER=PCI_BUS_ID"
+            )
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(selected)
+    return selected[0] if len(selected) == 1 else "[" + ",".join(selected) + "]"
+
+
 def validate_simulator_options(opt):
     """Keep each Collab site's initialized object in a persistent worker."""
     if opt.num_clients <= 0:
@@ -117,6 +157,8 @@ def validate_simulator_options(opt):
                 "use --max-in-flight to limit training concurrency"
             )
     if opt.nvflare_gpu is not None:
+        if opt.device == "cpu":
+            raise ValueError("--nvflare-gpu requires --device cuda")
         # Multiple GPU groups make the 2.9 simulator force one worker per group
         # and rotate its clients, losing Collab objects and their RPC handlers.
         gpu = opt.nvflare_gpu.replace(" ", "")
@@ -134,7 +176,7 @@ def execute_exported_job(opt):
     server_path = job_dir / "app_server" / "config" / "data" / "server.pt"
     site_paths = [job_dir / f"app_site-{i + 1}" / "config" / "data" / "site.pt" for i in range(opt.num_clients)]
     recipe = make_recipe(server_path, site_paths)
-    gpu = opt.nvflare_gpu or ("0" if opt.device == "cuda" else None)
+    gpu = opt.nvflare_gpu
     # SimEnv owns job deployment and execution; each Collab call carries native tensors.
     run = recipe.execute(
         SimEnv(
@@ -182,20 +224,40 @@ def run_simulator(opt, job_dir, output):
 
 
 def main(args=None):
+    # The configuration module queries CUDA at import time. Resolve visibility
+    # first, before that query can lock the runtime to the wrong physical GPU.
+    bootstrap = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    bootstrap.add_argument("--device", default=None)
+    bootstrap.add_argument("--nvflare-gpu", default=None)
+    selection, _ = bootstrap.parse_known_args(args)
+    try:
+        gpu = configure_cuda(selection.device, selection.nvflare_gpu)
+    except ValueError as error:
+        bootstrap.error(str(error))
+    from configs.TCGA_BRCA import build_parser, finalize_opt
+
     parser = build_parser()
+    parser.allow_abbrev = False
     parser.description = "BreastG-FCL federated continual learning with the NVFlare Collab API"
     parser.add_argument("--smoke", action="store_true", help="Use a small synthetic validation fixture")
     parser.add_argument("--export-only", action="store_true")
     parser.add_argument("--nvflare-workspace", default=None)
     parser.add_argument("--nvflare-threads", type=int, default=None, help="Must equal the client count (default)")
-    parser.add_argument("--nvflare-gpu", default=None, help="Single GPU ID or shared GPU group, e.g. '0' or '[0,1]'")
+    parser.add_argument(
+        "--nvflare-gpu",
+        default=None,
+        help="Physical GPU ID or shared group for preparation, server and clients; defaults to inherited visibility",
+    )
     parser.add_argument("--nvflare-timeout", type=int, default=300)
     parser.add_argument("--run-exported-job", help=argparse.SUPPRESS)
     args = parser.parse_args(args)
+    args.nvflare_gpu = gpu
     if args.nvflare_timeout <= 0:
         parser.error("--nvflare-timeout must be positive")
     try:
         validate_simulator_options(args)
+        if gpu is not None and not torch.cuda.is_available():
+            raise ValueError("--nvflare-gpu selected no available CUDA device")
     except ValueError as error:
         parser.error(str(error))
     torch.set_num_threads(1)

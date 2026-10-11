@@ -220,9 +220,10 @@ class ModifiedClient(nn.Module):
                 losses[name] += value.item()
             count += 1
 
-        if count:
-            losses = {name: value / count for name, value in losses.items()}
-            self.lr_scheduler_EFG.step()
+        if count == 0:
+            raise ValueError(f"Client {self.client_id}: task {task}, epoch {epoch} has no training batches")
+        losses = {name: value / count for name, value in losses.items()}
+        self.lr_scheduler_EFG.step()
         logger.info("Client %s, Task %s, Epoch %s: %s", self.client_id, task, epoch, losses)
         return {"loss_values": losses, "encodings": encodings, "graph_embeddings": graph_rows}
 

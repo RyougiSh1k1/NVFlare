@@ -227,6 +227,7 @@ class NVFlareJobTest(unittest.TestCase):
             output = Path(directory)
             self.opt.nvflare_workspace = str(output / "separate workspace")
             self.opt.nvflare_gpu = "1"
+            self.opt.device = "cuda"
             torch.save({}, output / "final_state.pt")
             with patch.object(collab_job.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
                 collab_job.run_simulator(self.opt, output / "job", output)
@@ -241,6 +242,7 @@ class NVFlareJobTest(unittest.TestCase):
             self.opt.nvflare_workspace = str(root / "workspace")
             self.opt.nvflare_threads = 2
             self.opt.nvflare_gpu = "1"
+            self.opt.device = "cuda"
             with patch.object(collab_job, "make_recipe") as make_recipe:
                 collab_job.execute_exported_job(self.opt)
             prepared = Path(self.opt.run_exported_job)
@@ -262,6 +264,7 @@ class NVFlareJobTest(unittest.TestCase):
                 with self.subTest(threads=threads, gpu=gpu):
                     opt = copy.copy(self.opt)
                     opt.nvflare_threads, opt.nvflare_gpu = threads, gpu
+                    opt.device = "cuda"
                     collab_job.validate_simulator_options(opt)
 
     def test_invalid_simulator_options_fail_before_preparation_or_subprocess(self):
@@ -310,6 +313,127 @@ class NVFlareJobTest(unittest.TestCase):
                             collab_job.run_simulator(opt, output / "exported job", output)
                         recipe.assert_not_called()
                         run.assert_not_called()
+
+    def test_cuda_selection_preserves_physical_ids_and_shared_group_order(self):
+        for gpu, mask, expected in (("2", "2", "2"), ("[ 2, 1 ]", "2,1", "[2,1]")):
+            with self.subTest(gpu=gpu), patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(collab_job.configure_cuda("cuda", gpu), expected)
+                self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], mask)
+                self.assertEqual(os.environ["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+                # A fresh simulator interpreter can repeat the same selection.
+                self.assertEqual(collab_job.configure_cuda("cuda", expected), expected)
+
+    def test_cuda_selection_preserves_inherited_masks_without_worker_override(self):
+        for mask in (None, "", "2,1", "GPU-fixture", "MIG-fixture"):
+            with self.subTest(mask=mask), patch.dict(os.environ, {}, clear=True):
+                if mask is not None:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = mask
+                os.environ["CUDA_DEVICE_ORDER"] = "FASTEST_FIRST"
+                before = dict(os.environ)
+                self.assertIsNone(collab_job.configure_cuda(None, None))
+                self.assertEqual(dict(os.environ), before)
+                opt = copy.copy(self.opt)
+                opt.device = "cuda"
+                opt.run_exported_job = "/tmp/exported"
+                opt.nvflare_workspace = "/tmp/workspace"
+                with patch.object(collab_job, "make_recipe") as recipe:
+                    collab_job.execute_exported_job(opt)
+                env = recipe.return_value.execute.call_args.args[0]
+                self.assertIsNone(env.gpu_config)
+
+    def test_explicit_gpu_respects_inherited_limits_and_rejects_ambiguous_masks(self):
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "3,2,1", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}):
+            self.assertEqual(collab_job.configure_cuda("cuda", "[2,1]"), "[2,1]")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "2,1")
+        for mask, order in (
+            ("", "PCI_BUS_ID"),
+            ("0", "PCI_BUS_ID"),
+            ("GPU-fixture", "PCI_BUS_ID"),
+            ("1", "FASTEST_FIRST"),
+            ("1", None),
+        ):
+            with self.subTest(mask=mask, order=order), patch.dict(os.environ, {}, clear=True):
+                os.environ["CUDA_VISIBLE_DEVICES"] = mask
+                if order:
+                    os.environ["CUDA_DEVICE_ORDER"] = order
+                before = dict(os.environ)
+                with self.assertRaisesRegex(ValueError, "inherited CUDA_VISIBLE_DEVICES"):
+                    collab_job.configure_cuda("cuda", "1")
+                self.assertEqual(dict(os.environ), before)
+
+    def test_invalid_gpu_selection_fails_before_environment_changes(self):
+        cases = (("cpu", "1"), ("cuda:1", None), ("cuda", "[1,1]"), ("cuda", "0,1"))
+        for device, gpu in cases:
+            with self.subTest(device=device, gpu=gpu), patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ValueError):
+                    collab_job.configure_cuda(device, gpu)
+                self.assertEqual(dict(os.environ), {})
+        with patch.object(torch.cuda, "is_initialized", return_value=True):
+            with self.assertRaisesRegex(ValueError, "fresh interpreter"):
+                collab_job.configure_cuda("cuda", "1")
+
+    def test_cpu_selection_hides_cuda_before_configuration_import(self):
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1"}):
+            self.assertIsNone(collab_job.configure_cuda("cpu", None))
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "")
+
+    def test_selection_precedes_cuda_queries_in_all_launcher_modes(self):
+        # Run a fresh interpreter so an already imported config cannot hide an
+        # early CUDA query. The query stub observes visibility, without a GPU.
+        script = textwrap.dedent(
+            """
+            import os
+            import sys
+            from unittest.mock import patch
+            import torch
+
+            def available():
+                assert os.environ.get('CUDA_VISIBLE_DEVICES') == '1', dict(os.environ)
+                assert os.environ.get('CUDA_DEVICE_ORDER') == 'PCI_BUS_ID'
+                return True
+
+            with patch.object(torch.cuda, 'is_available', side_effect=available):
+                import job
+                def prepare(opt, smoke):
+                    available()
+                    assert opt.device == 'cuda' and opt.nvflare_gpu == '1'
+                    return None, {}, []
+                def execute(opt):
+                    available()
+                    assert opt.nvflare_gpu == '1'
+                with patch.object(job, 'prepare_bundles', side_effect=prepare), \
+                     patch.object(job, 'export_job', return_value='/tmp/exported'), \
+                     patch.object(job, 'execute_exported_job', side_effect=execute), \
+                     patch.object(job, 'run_simulator', side_effect=lambda *a: available()), \
+                     patch.object(torch.cuda, 'empty_cache'):
+                    job.main(sys.argv[1:])
+            """
+        )
+        for mode in ([], ["--export-only"], ["--run-exported-job", "/tmp/exported"]):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                env = dict(os.environ)
+                env.pop("CUDA_VISIBLE_DEVICES", None)
+                env.pop("CUDA_DEVICE_ORDER", None)
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        "--device",
+                        "cuda",
+                        "--nvflare-gpu",
+                        "1",
+                        "--output-dir",
+                        directory,
+                        *mode,
+                    ],
+                    cwd=PROJECT_DIR,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_simulator_requires_successful_exit_and_final_state_artifact(self):
         for return_code, artifact in ((1, True), (0, False)):

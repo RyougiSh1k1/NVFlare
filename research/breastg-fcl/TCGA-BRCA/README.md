@@ -381,11 +381,20 @@ does not measure TCGA accuracy.
 | `--max-in-flight N` | Controls concurrent client operations; defaults to `min(num_clients, 8)` |
 | `--nvflare-workspace PATH` | Simulator workspace; defaults to `OUTPUT_DIR/nvflare_workspace` |
 | `--nvflare-threads N` | Defaults to the client count and must equal it, keeping every Collab client process resident |
-| `--nvflare-gpu IDS` | One GPU ID, e.g. `0`, or one shared GPU group, e.g. `'[0,1]'`; CPU runs need no GPU setting |
+| `--nvflare-gpu IDS` | Physical GPU ID, e.g. `1`, or one shared GPU group, e.g. `'[1,2]'`; defaults to inherited CUDA visibility |
 
 Use `--max-in-flight` to adjust training concurrency. All clients share the
 selected GPU or GPU group; separate groups such as `--nvflare-gpu 0,1` are
 rejected because NVFlare 2.9 would rotate client workers.
+
+`--device cuda --nvflare-gpu 1` selects the same physical GPU for data/model
+preparation, the server, and all clients, including job export. IDs follow
+`nvidia-smi` ordering (`CUDA_DEVICE_ORDER=PCI_BUS_ID`). Without `--nvflare-gpu`,
+the launcher and workers preserve the inherited CUDA mask and ordering.
+If a mask is already set, an explicit selection must be a subset of a numeric
+mask with PCI bus ordering; otherwise omit `--nvflare-gpu` to use that mask
+unchanged (including GPU UUID/MIG masks). CPU mode rejects `--nvflare-gpu`.
+Launch the command in a fresh Python process so selection precedes CUDA queries.
 
 Graph controls remain available through the same default entry point:
 
